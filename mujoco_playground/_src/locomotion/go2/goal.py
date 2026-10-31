@@ -17,9 +17,6 @@ from mujoco_playground._src.locomotion.go2 import go2_constants as consts
 
 
 def default_config() -> config_dict.ConfigDict:
-  # Go2 port: everything below is identical to the Go1 joystick config, so the
-  # first Go2 result can be compared directly with the Go1 baseline. Values you
-  # will most likely want to tune for Go2 are marked "Go2:".
   return config_dict.create(
       ctrl_dt=0.02,
       sim_dt=0.004,
@@ -56,6 +53,7 @@ def default_config() -> config_dict.ConfigDict:
               bias=1.0,
               stall=-1.0,
               heading=-0.5,
+              heading_track=0.0, 
               # Base reward.
               lin_vel_z=-0.5,
               ang_vel_xy=-0.05,
@@ -103,6 +101,16 @@ def default_config() -> config_dict.ConfigDict:
        fall_height=-0.05,     # height below which the robot is considered fallen
        ring=False, 
        ring_radius=[3.8, 4.4], 
+       heading_goal=False,       # True: goal includes heading; False: goal is only position
+       init_yaw_range=3.14,       # initial yaw range for the robot (radians)
+       cam_offset_x=0.0,         # camera offset in x direction (m)
+       heading_success_tol=0.5,  # heading success tolerance (radians)
+       yaw_mode="random",        # "random": target yaw ~ U(-pi, pi); "travel": along spawn->target direction
+       yaw_jitter=0.5,           # +-jitter (rad) added to the travel direction in "travel" mode
+       time_mode="window",       # "window": reward in the last T_r s (current); "gauss": Gaussian around a deadline
+       peak_range=[4.0, 4.0],# deadline t_dl (s after segment start), sampled U(lo, hi) per segment
+       time_sigma=0.5,           # Gaussian width (s) for time_mode="gauss"
+
       ),
       collision="model",
       naccdmax=None,   
@@ -165,6 +173,13 @@ class Goal(go2_base.Go2Env):
         config=config,
         config_overrides=config_overrides,
     )
+     # Shift the depth camera forward/backward along the body x axis.
+    off = self._config.goal_config.cam_offset_x
+    if off != 0.0:
+      cam_id = self._mj_model.camera(self._config.vision_camera).id
+      self._mj_model.cam_pos[cam_id, 0] += off
+      self._mjx_model = mjx_env.put_model(self._mj_model, impl=self._config.impl)
+
     self._post_init()
 
     # rendering
@@ -233,6 +248,8 @@ class Goal(go2_base.Go2Env):
     goal = self._config.goal_config
     self._segment_steps = int(round(goal.segment_time / self._config.ctrl_dt))   # 5s -> 250 steps
     self._window_steps = int(round(goal.reward_window / self._config.ctrl_dt))   # 1s -> 50 steps
+    self._peak_lo = int(round(goal.peak_range[0] / self._config.ctrl_dt))
+    self._peak_hi = int(round(goal.peak_range[1] / self._config.ctrl_dt))
 
     # self._illegal_contact_sensor = [
     # self._mj_model.sensor(f"{b}_floor_found").id
@@ -256,7 +273,7 @@ class Goal(go2_base.Go2Env):
     g = self._config.goal_config
     if g.ring:
       xy = jax.random.uniform(key, (2,), minval=-0.1, maxval=0.1)
-    if g.boxes:
+    elif g.boxes:
       lo, hi = jp.array(g.spawn_box[0]), jp.array(g.spawn_box[1])
       xy = jax.random.uniform(key, (2,), minval=lo, maxval=hi)
     else:
@@ -264,7 +281,8 @@ class Goal(go2_base.Go2Env):
     qpos = qpos.at[0:2].set(xy)
 
     rng, key = jax.random.split(rng)
-    yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
+    # yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
+    yaw = jax.random.uniform(key, (1,), minval=-g.init_yaw_range, maxval=g.init_yaw_range)
     quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
     new_quat = math.quat_mul(qpos[3:7], quat)
     qpos = qpos.at[3:7].set(new_quat)
@@ -321,6 +339,12 @@ class Goal(go2_base.Go2Env):
     rng, key = jax.random.split(rng)
     spawn_xy = qpos[0:2]                    
     target_xy = self._sample_target(key, spawn_xy)
+    # rng, key_yaw = jax.random.split(rng)
+    # target_yaw = jax.random.uniform(key_yaw, (), minval=-jp.pi, maxval=jp.pi)
+    rng, key_yaw = jax.random.split(rng)
+    target_yaw = self._sample_target_yaw(key_yaw, spawn_xy, target_xy)
+    rng, key_peak = jax.random.split(rng)
+    peak_left = self._sample_peak_left(key_peak)
 
     info = {
         "rng": rng,
@@ -328,6 +352,7 @@ class Goal(go2_base.Go2Env):
         # "steps_until_next_cmd": steps_until_next_cmd,
         "spawn_xy": spawn_xy,
         "target_xy": target_xy,
+        "target_yaw": target_yaw,
         "steps_left": jp.array(self._segment_steps, dtype=jp.int32),
         "last_act": jp.zeros(self.mjx_model.nu),
         "last_last_act": jp.zeros(self.mjx_model.nu),
@@ -343,7 +368,9 @@ class Goal(go2_base.Go2Env):
         "pert_mag": pert_mag,
         "bias_on": jp.array(1.0),     
         "reach_ema": jp.array(0.0),   
-        "ep_reach": jp.array(0.0),    
+        "ep_reach": jp.array(0.0),   
+        "peak_left": peak_left,
+        "arrived_left": jp.array(-1, dtype=jp.int32)
     }
 
     metrics = {}
@@ -351,9 +378,13 @@ class Goal(go2_base.Go2Env):
       metrics[f"reward/{k}"] = jp.zeros(())
     metrics["swing_peak"] = jp.zeros(())
     metrics["success"] = jp.zeros(())
+    metrics["success_heading"] = jp.zeros(())
+    metrics["final_heading_err"] = jp.zeros(())
     metrics["final_dist"] = jp.zeros(())
     metrics["bias_on"] = jp.zeros(())
     metrics["fell_off"] = jp.zeros(())
+    metrics["success_peak"] = jp.zeros(())
+    metrics["arrival_time"] = jp.zeros(())
 
     obs = self._get_obs(data, info)
     if self._config.vision and not self._skip_render:
@@ -432,10 +463,32 @@ class Goal(go2_base.Go2Env):
     # )
 
     d = jp.linalg.norm(state.info["target_xy"] - data.qpos[0:2]) # distance to target
+    fwd = data.xmat[self._torso_body_id][:2, 0]
+    yaw = jp.arctan2(fwd[1], fwd[0])
+    dpsi = jp.arctan2(jp.sin(state.info["target_yaw"] - yaw), jp.cos(state.info["target_yaw"] - yaw))
+
+    r = self._config.goal_config.success_radius
+    at_peak = state.info["steps_left"] == state.info["peak_left"]
+    state.metrics["success_peak"] = (at_peak & (d < r)).astype(jp.float32)
+    first = (d < r) & (state.info["arrived_left"] < 0)
+    state.info["arrived_left"] = jp.where(first, state.info["steps_left"], state.info["arrived_left"])
+    arr_t = (self._segment_steps - state.info["arrived_left"]) * self._config.ctrl_dt
+    state.metrics["arrival_time"] = jp.where(state.info["arrived_left"] >= 0, arr_t,
+                                             self._config.goal_config.segment_time) * timeout
+    state.info["arrived_left"] = jp.where(done, -1, state.info["arrived_left"])
+
 
     state.info["rng"], key = jax.random.split(state.info["rng"])
     new_target = self._sample_target(key, state.info["spawn_xy"])
     state.info["target_xy"] = jp.where(done, new_target, state.info["target_xy"])
+    state.info["rng"], key_yaw = jax.random.split(state.info["rng"])
+    # new_yaw = jax.random.uniform(key_yaw, (), minval=-jp.pi, maxval=jp.pi)
+    # state.info["target_yaw"] = jp.where(done, new_yaw, state.info["target_yaw"])
+    new_yaw = self._sample_target_yaw(key_yaw, state.info["spawn_xy"], new_target)
+    state.info["target_yaw"] = jp.where(done, new_yaw, state.info["target_yaw"])
+    state.info["rng"], key_peak = jax.random.split(state.info["rng"])
+    state.info["peak_left"] = jp.where(done, self._sample_peak_left(key_peak),          state.info["peak_left"])
+
     state.info["steps_left"] = jp.where(
         done, self._segment_steps, state.info["steps_left"]
     )
@@ -460,6 +513,10 @@ class Goal(go2_base.Go2Env):
     state.metrics["success"] = success.astype(jp.float32)
     state.metrics["fell_off"] = (data.qpos[2] < self._config.goal_config.fall_height).astype(jp.float32)
     state.metrics["final_dist"] = d * timeout
+
+    heading_ok = jp.abs(dpsi) < self._config.goal_config.heading_success_tol
+    state.metrics["success_heading"] = (success & heading_ok).astype(jp.float32)
+    state.metrics["final_heading_err"] = jp.abs(dpsi) * timeout
 
     done = done.astype(reward.dtype)
     state = state.replace(  # pyrefly: ignore[missing-attribute]
@@ -543,7 +600,17 @@ class Goal(go2_base.Go2Env):
     c, s = jp.cos(yaw), jp.sin(yaw)
     target_b = jp.array([c * delta[0] + s * delta[1],  
                          -s * delta[0] + c * delta[1]])
-    time_left = jp.array([info["steps_left"] / self._segment_steps])   
+    # time_left = jp.array([info["steps_left"] / self._segment_steps])   
+    if self._config.goal_config.time_mode == "gauss":
+      time_left = jp.array([(info["steps_left"] - info["peak_left"]) / self._segment_steps])
+    else:
+      time_left = jp.array([info["steps_left"] / self._segment_steps])
+
+    dpsi = info["target_yaw"] - yaw
+    dpsi = jp.arctan2(jp.sin(dpsi), jp.cos(dpsi))      # normalize to [-pi, pi]
+    head_obs = jp.where(self._config.goal_config.heading_goal,
+                        jp.array([jp.sin(dpsi), jp.cos(dpsi)]),
+                        jp.zeros(2))
 
 
     state = jp.hstack([
@@ -556,6 +623,7 @@ class Goal(go2_base.Go2Env):
         # info["command"],  # 3
         target_b,  # 2
         time_left,  # 1
+        head_obs,  # 2
     ])
 
     accelerometer = self.get_accelerometer(data)
@@ -602,6 +670,9 @@ class Goal(go2_base.Go2Env):
     moving = d > self._config.goal_config.success_radius
     fwd = data.xmat[self._torso_body_id][:2, 0]       
     fwd_xy = fwd / (jp.linalg.norm(fwd) + 1e-6)
+    yaw = jp.arctan2(fwd[1], fwd[0])
+    dpsi = info["target_yaw"] - yaw
+    dpsi = jp.arctan2(jp.sin(dpsi), jp.cos(dpsi))   
     return {
         # "tracking_lin_vel": self._reward_tracking_lin_vel(
         #     info["command"], self.get_local_linvel(data)
@@ -609,7 +680,8 @@ class Goal(go2_base.Go2Env):
         # "tracking_ang_vel": self._reward_tracking_ang_vel(
         #     info["command"], self.get_gyro(data)
         # ),
-        "reach": self._reward_reach(d, info["steps_left"]),
+        # "reach": self._reward_reach(d, info["steps_left"]),
+        "reach": self._reward_reach(d, info["steps_left"], info["peak_left"]),
         # "bias": self._reward_bias(v_xy, to_target),
         "bias": self._reward_bias(v_xy, to_target) * info["bias_on"],
         "stall": self._cost_stall(moving, v_xy),
@@ -620,6 +692,10 @@ class Goal(go2_base.Go2Env):
         "stand_still": self._cost_stand_still(moving, data.qpos[7:]),
         # "heading": self._reward_heading(fwd_xy, to_target, moving),
         "heading": self._cost_heading(fwd_xy, to_target, moving),
+        # "heading_track": self._reward_heading_track(dpsi, info["steps_left"])
+        #                  * self._config.goal_config.heading_goal,
+        "heading_track": self._reward_heading_track(dpsi, info["steps_left"], info["peak_left"])
+                         * self._config.goal_config.heading_goal,
         "termination": self._cost_termination(done),
         "pose": self._reward_pose(data.qpos[7:]),
         "torques": self._cost_torques(data.actuator_force),
@@ -660,11 +736,35 @@ class Goal(go2_base.Go2Env):
   #   return jp.exp(-ang_vel_error / self._config.reward_config.tracking_sigma)
 
   # Goal rewards 
-  def _reward_reach(self, d: jax.Array, steps_left: jax.Array) -> jax.Array:
-    # Reward for reaching the target.
-    t_r = self._config.goal_config.reward_window
-    active = steps_left < self._window_steps
-    return active * (1.0 / t_r) / (1.0 + jp.square(d))
+  def _time_factor(self, steps_left, peak_left):
+    g = self._config.goal_config
+    if g.time_mode == "gauss":
+      dt_s = (steps_left - peak_left) * self._config.ctrl_dt     # >0 before the deadline, <0 after
+      return jp.exp(-0.5 * jp.square(dt_s / g.time_sigma)) / (g.time_sigma * jp.sqrt(2 * jp.pi))
+    return (steps_left < self._window_steps) * (1.0 / g.reward_window)
+
+
+  # def _reward_reach(self, d: jax.Array, steps_left: jax.Array) -> jax.Array:
+  #   # Reward for reaching the target.
+  #   t_r = self._config.goal_config.reward_window
+  #   active = steps_left < self._window_steps
+  #   return active * (1.0 / t_r) / (1.0 + jp.square(d))
+
+  def _reward_reach(self, d, steps_left, peak_left):
+    return self._time_factor(steps_left, peak_left) / (1.0 + jp.square(d))
+
+  def _reward_heading_track(self, dpsi, steps_left, peak_left):
+    return self._time_factor(steps_left, peak_left) * (1.0 - 0.5 * jp.abs(dpsi))
+
+  def _sample_peak_left(self, rng):
+    dl = jax.random.randint(rng, (), self._peak_lo, self._peak_hi + 1)   # steps after segment start
+    return (self._segment_steps - dl).astype(jp.int32)               # steps_left at the deadline
+
+  # def _reward_heading_track(self, dpsi: jax.Array, steps_left: jax.Array) -> jax.Array:
+  #   # Reward for facing the target heading in the last T_r seconds
+  #   t_r = self._config.goal_config.reward_window
+  #   active = steps_left < self._window_steps
+  #   return active * (1.0 / t_r) * (1.0 - 0.5 * jp.abs(dpsi))
 
   def _reward_bias(self, v_xy: jax.Array, to_target: jax.Array) -> jax.Array:
     # Reward for moving in the direction of the target.
@@ -852,6 +952,16 @@ class Goal(go2_base.Go2Env):
     lo, hi = self._config.goal_config.dist_range
     r = jax.random.uniform(rng_r, minval=lo, maxval=hi)
     return center_xy + r * jp.array([jp.cos(angle), jp.sin(angle)])
+  
+  def _sample_target_yaw(self, rng: jax.Array, from_xy: jax.Array, target_xy: jax.Array) -> jax.Array:
+    g = self._config.goal_config
+    if g.yaw_mode == "travel":
+      d = target_xy - from_xy
+      travel = jp.arctan2(d[1], d[0])
+      return travel + jax.random.uniform(rng, (), minval=-g.yaw_jitter, maxval=g.yaw_jitter)
+    return jax.random.uniform(rng, (), minval=-jp.pi, maxval=jp.pi)
+
+  
   
   def sample_command(self, rng: jax.Array, x_k: jax.Array) -> jax.Array:
     rng, y_rng, w_rng, z_rng = jax.random.split(rng, 4)
