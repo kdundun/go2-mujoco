@@ -1,0 +1,1 @@
+Checkpoint commit was successful to /home/wgy98/mujoco_playground/logs/Go2GoalBeams-20261030-023923-beams_b_heading/checkpoints/000050135040

@@ -1,0 +1,36 @@
+# Policy C (depth, terrain + feet): Flat 100M -> Bridge 50M -> Beams 50M
+name: c_fbb
+camera: [0, 3]             # null = blind; [0] = terrain only; [0, 3] = terrain + feet
+
+common:              
+  impl: warp
+  num_envs: 1024
+  batch_size: 128
+  num_minibatches: 8
+  use_tb: true
+  log_training_metrics: true
+  training_metrics_steps: 2000000
+
+stages:
+  - env: Go2GoalFlatTerrain
+    suffix: flat5m_c_heading 
+    steps: 100_000_000     # lr 3e-4, gamma 0.99 (defaults in locomotion_params.py)
+    overrides:
+      goal_config.dist_range: [1.0, 5.0]
+      goal_config.segment_time: 6.0
+
+  - env: Go2GoalBridge
+    suffix: bridge_c_heading
+    steps: 50_000_000
+    learning_rate: 1.0e-4
+    discounting: 0.997
+    overrides:
+      reward_config.scales.bias: 0.0
+
+  - env: Go2GoalBeams
+    suffix: beams_c_heading
+    steps: 50_000_000
+    learning_rate: 1.0e-4
+    discounting: 0.997
+    overrides:
+      reward_config.scales.bias: 0.0

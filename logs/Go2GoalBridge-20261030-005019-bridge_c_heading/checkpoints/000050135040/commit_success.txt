@@ -1,0 +1,1 @@
+Checkpoint commit was successful to /home/wgy98/mujoco_playground/logs/Go2GoalBridge-20261030-005019-bridge_c_heading/checkpoints/000050135040

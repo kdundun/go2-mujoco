@@ -1,0 +1,1 @@
+Checkpoint commit was successful to /home/wgy98/mujoco_playground/logs/Go2GoalFlatTerrain-20261029-222153-flat5m_c_heading/checkpoints/000100085760

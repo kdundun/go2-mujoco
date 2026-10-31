@@ -1,0 +1,20 @@
+.DS_Store
+__pycache__
+*.egg-info
+.venv
+MUJOCO_LOG.TXT
+mujoco_menagerie
+checkpoints/
+logs
+.mujoco_playground_asset_cache/
+
+# local outputs (Go2 experiments)
+ckpt_*/
+run_logs/
+run_all.log
+*.mp4
+stage_rewards.png
+hfield_view.png
+**/camera_checks/
+__pycache__/
+*.bak
