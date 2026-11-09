@@ -39,8 +39,12 @@ FEET_ONLY_ROUGH_TERRAIN_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_rough_ter
 FEET_ONLY_BRIDGE_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_bridge.xml"
 FEET_ONLY_BRIDGE_FILLED_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_bridge_filled.xml"
 FEET_ONLY_BEAMS_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_beams.xml"
-
-
+FEET_ONLY_BEAMS_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_beams.xml"
+FEET_ONLY_BEAMS_CUR_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_beams_cur.xml" 
+FEET_ONLY_RINGS_CUR_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_rings_cur.xml"
+FEET_ONLY_RINGS_MULTI_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_rings_multi.xml"
+FEET_ONLY_ONEGAP10_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_onegap10.xml"
+FEET_ONLY_BEAMS_FLAT_XML = ROOT_PATH / "xmls" / "scene_mjx_feetonly_beams_flat.xml"
 
 def task_to_xml(task_name: str) -> epath.Path:
   return {
@@ -50,6 +54,11 @@ def task_to_xml(task_name: str) -> epath.Path:
       "bridge": FEET_ONLY_BRIDGE_XML,
       "bridge_filled": FEET_ONLY_BRIDGE_FILLED_XML,
       "beams": FEET_ONLY_BEAMS_XML,
+      "beams_flat": FEET_ONLY_BEAMS_FLAT_XML,
+      "beams_cur": FEET_ONLY_BEAMS_CUR_XML,
+      "rings_cur": FEET_ONLY_RINGS_CUR_XML,
+      "rings_multi":FEET_ONLY_RINGS_MULTI_XML,
+      "onegap10": FEET_ONLY_ONEGAP10_XML
   }[task_name]
 
 

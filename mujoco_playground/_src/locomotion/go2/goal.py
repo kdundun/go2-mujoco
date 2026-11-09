@@ -13,7 +13,7 @@ import numpy as np
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.locomotion.go2 import base as go2_base
 from mujoco_playground._src.locomotion.go2 import go2_constants as consts
-
+import json
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -51,6 +51,7 @@ def default_config() -> config_dict.ConfigDict:
               # Goal.
               reach=10.0,
               bias=1.0,
+              tracking=0.0,
               stall=-1.0,
               heading=-0.5,
               heading_track=0.0, 
@@ -101,15 +102,30 @@ def default_config() -> config_dict.ConfigDict:
        fall_height=-0.05,     # height below which the robot is considered fallen
        ring=False, 
        ring_radius=[3.8, 4.4], 
+       beam_cur=False,                       # True: beam-width curriculum (task="beams_cur")
+       terrain_json="terrain_beams_cur.json",
+       max_init_level=1,                     # initial terrain level
+       fixed_level=-1,                       # >=0 : fixed terrain level
+       beam_r_range=[1.5, 4.2],              # the distance from the center to the beam center (m)
+       beam_spawn_jitter=0.1,                # born in the center of the beam with a jitter 
+       promote_streak=2, 
+       demote_on="fell", 
+       cur_target="beams",       # "beams": target on the beam; "ring": target on the ring
+       target_r_range=[1.0, 5.0],    # rings_polar： target distance range (m)
+       target_margin=0.00,           # margin from the edge of the ring (m)
+       target_max_half=5.0,          # max half distance from the center to the target (m)
        heading_goal=False,       # True: goal includes heading; False: goal is only position
        init_yaw_range=3.14,       # initial yaw range for the robot (radians)
        cam_offset_x=0.0,         # camera offset in x direction (m)
        heading_success_tol=0.5,  # heading success tolerance (radians)
        yaw_mode="random",        # "random": target yaw ~ U(-pi, pi); "travel": along spawn->target direction
        yaw_jitter=0.5,           # +-jitter (rad) added to the travel direction in "travel" mode
-       time_mode="window",       # "window": reward in the last T_r s (current); "gauss": Gaussian around a deadline
-       peak_range=[4.0, 4.0],# deadline t_dl (s after segment start), sampled U(lo, hi) per segment
+       time_mode="window",       # "window": reward in the last T_r s (current); "gauss": Gaussian around a peak time
+       peak_range=[4.0, 4.0],    # peak time (s after segment start), sampled U(lo, hi) per segment
        time_sigma=0.5,           # Gaussian width (s) for time_mode="gauss"
+       target_far_frac=0.5,
+       aim_mode="fixed",         # "fixed": target yaw set once per segment; "dynamic": every step, robot -> target
+       v_cmd=0.8,                # speed cap (m/s) of the tracking reward
 
       ),
       collision="model",
@@ -155,7 +171,7 @@ class Goal(go2_base.Go2Env):
       config: config_dict.ConfigDict = default_config(),
       config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
   ):
-    if task.startswith("rough") or task.startswith("bridge") or task == "beams":
+    if task.startswith("rough") or task.startswith("bridge") or task.startswith("beams") or task.startswith("rings") or task.startswith("onegap"):
       config.naconmax = 8 * 8192
       config.njmax = 128
       config.naccdmax = 8 * 8192 
@@ -168,6 +184,37 @@ class Goal(go2_base.Go2Env):
       config.goal_config.ring = True
       config.goal_config.segment_time = 8.0
       config.episode_length = 400
+
+    if task == "beams_cur":                  
+      config.goal_config.beam_cur = True
+      config.goal_config.segment_time = 8.0
+      config.episode_length = 400
+    if task == "beams_flat":
+      config.goal_config.beam_cur = True
+      config.goal_config.cur_target = "beams"
+      config.goal_config.terrain_json = "terrain_beams_flat.json"
+      config.goal_config.segment_time = 8.0
+      config.episode_length = 400
+
+    if task == "rings_cur":
+      config.goal_config.beam_cur = True              
+      config.goal_config.cur_target = "rings"
+      config.goal_config.terrain_json = "terrain_rings_cur.json"
+      config.goal_config.segment_time = 8.0
+      config.episode_length = 400
+    if task == "rings_multi":
+      config.goal_config.beam_cur = True
+      config.goal_config.cur_target = "rings_multi"
+      config.goal_config.terrain_json = "terrain_rings_multi.json"
+      config.goal_config.segment_time = 8.0
+      config.episode_length = 400
+    if task == "onegap10":
+      config.goal_config.beam_cur = True
+      config.goal_config.cur_target = "rings_multi"
+      config.goal_config.terrain_json = "terrain_onegap10.json"
+      config.goal_config.segment_time = 8.0
+      config.episode_length = 400
+
     super().__init__(
         xml_path=consts.task_to_xml(task).as_posix(),
         config=config,
@@ -179,6 +226,21 @@ class Goal(go2_base.Go2Env):
       cam_id = self._mj_model.camera(self._config.vision_camera).id
       self._mj_model.cam_pos[cam_id, 0] += off
       self._mjx_model = mjx_env.put_model(self._mj_model, impl=self._config.impl)
+
+    if self._config.goal_config.beam_cur:                 
+      J = json.load(open(consts.ROOT_PATH / "xmls" / self._config.goal_config.terrain_json))
+      self._lvl_origin = jp.array(J["origins"])[:, :2]
+      self._n_levels = len(J["origins"])
+      self._n_beams = J["num_beams"]
+      if "ring_c" in J:       
+        self._ring_c = jp.array(J["ring_c"])  
+      if "gap_inner" in J:                                      
+        self._gap_inner = jp.array(J["gap_inner"])
+        self._gap_outer = jp.array(J["gap_outer"])
+      if "gaps" in J:
+        self._gaps = jp.array(J["gaps"])   
+      if "frame_c" in J:
+        self._frame_c = float(J["frame_c"])
 
     self._post_init()
 
@@ -228,7 +290,7 @@ class Goal(go2_base.Go2Env):
     self._feet_site_id = np.array(
         [self._mj_model.site(name).id for name in consts.FEET_SITES]
     )
-    self._floor_geom_id = self._mj_model.geom("floor").id
+    # self._floor_geom_id = self._mj_model.geom("floor").id
     self._feet_geom_id = np.array(
         [self._mj_model.geom(name).id for name in consts.FEET_GEOMS]
     )
@@ -271,7 +333,12 @@ class Goal(go2_base.Go2Env):
     # dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
     # qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
     g = self._config.goal_config
-    if g.ring:
+    level = jp.zeros((), jp.int32)
+    if g.beam_cur:
+      rng, key_lvl = jax.random.split(rng)
+      level = self._init_level(key_lvl)
+      xy = self._beam_spawn(key, level)
+    elif g.ring:      
       xy = jax.random.uniform(key, (2,), minval=-0.1, maxval=0.1)
     elif g.boxes:
       lo, hi = jp.array(g.spawn_box[0]), jp.array(g.spawn_box[1])
@@ -338,7 +405,11 @@ class Goal(go2_base.Go2Env):
     # )
     rng, key = jax.random.split(rng)
     spawn_xy = qpos[0:2]                    
-    target_xy = self._sample_target(key, spawn_xy)
+    if g.beam_cur:
+      target_xy = self._cur_target(key, level) 
+    else:
+      target_xy = self._sample_target(key, spawn_xy)
+
     # rng, key_yaw = jax.random.split(rng)
     # target_yaw = jax.random.uniform(key_yaw, (), minval=-jp.pi, maxval=jp.pi)
     rng, key_yaw = jax.random.split(rng)
@@ -351,6 +422,10 @@ class Goal(go2_base.Go2Env):
         # "command": cmd,
         # "steps_until_next_cmd": steps_until_next_cmd,
         "spawn_xy": spawn_xy,
+        "level": level,
+        "tgt_cross": jp.array(True),
+        "streak": jp.zeros((), jp.int32),
+        "dist0": jp.linalg.norm(target_xy - spawn_xy),
         "target_xy": target_xy,
         "target_yaw": target_yaw,
         "steps_left": jp.array(self._segment_steps, dtype=jp.int32),
@@ -373,6 +448,9 @@ class Goal(go2_base.Go2Env):
         "arrived_left": jp.array(-1, dtype=jp.int32)
     }
 
+    if g.cur_target in ("rings_polar", "rings_multi"):
+      info["tgt_cross"] = self._target_crosses_gap(target_xy, level)
+
     metrics = {}
     for k in self._config.reward_config.scales.keys():
       metrics[f"reward/{k}"] = jp.zeros(())
@@ -383,8 +461,10 @@ class Goal(go2_base.Go2Env):
     metrics["final_dist"] = jp.zeros(())
     metrics["bias_on"] = jp.zeros(())
     metrics["fell_off"] = jp.zeros(())
+    metrics["level"] = jp.zeros(())
     metrics["success_peak"] = jp.zeros(())
     metrics["arrival_time"] = jp.zeros(())
+    metrics["success_cross"] = jp.zeros(())
 
     obs = self._get_obs(data, info)
     if self._config.vision and not self._skip_render:
@@ -429,6 +509,11 @@ class Goal(go2_base.Go2Env):
     timeout = state.info["steps_left"] <= 0        
     done = fell | timeout
 
+    if self._config.goal_config.aim_mode == "dynamic":
+      da = state.info["target_xy"] - data.qpos[0:2]
+      far = jp.linalg.norm(da) > self._config.goal_config.success_radius   # near the goal: keep the last heading
+      state.info["target_yaw"] = jp.where(far, jp.arctan2(da[1], da[0]), state.info["target_yaw"])
+
     obs = self._get_obs(data, state.info)
     if self._config.vision and not self._skip_render:
       obs["pixels/depth"] = self._render_depth(data)
@@ -466,6 +551,7 @@ class Goal(go2_base.Go2Env):
     fwd = data.xmat[self._torso_body_id][:2, 0]
     yaw = jp.arctan2(fwd[1], fwd[0])
     dpsi = jp.arctan2(jp.sin(state.info["target_yaw"] - yaw), jp.cos(state.info["target_yaw"] - yaw))
+    success = timeout & ~fell & (d < self._config.goal_config.success_radius)
 
     r = self._config.goal_config.success_radius
     at_peak = state.info["steps_left"] == state.info["peak_left"]
@@ -477,10 +563,45 @@ class Goal(go2_base.Go2Env):
                                              self._config.goal_config.segment_time) * timeout
     state.info["arrived_left"] = jp.where(done, -1, state.info["arrived_left"])
 
+    g = self._config.goal_config
+    if g.beam_cur:
+      lvl = state.info["level"]
+      cross = state.info["tgt_cross"]
+      state.metrics["success_cross"] = (success & cross).astype(jp.float32)
+      streak = jp.where(done & cross, jp.where(success, state.info["streak"] + 1, 0), state.info["streak"])
+      up = done & success & (streak >= g.promote_streak)
+      if g.demote_on == "fell":
+        down = fell
+      elif g.demote_on == "half":
+        down = fell | (timeout & (d > 0.5 * state.info["dist0"]))
+      else:
+        down = fell | (timeout & ~success)  
+      state.info["rng"], key_lvl, key_sp = jax.random.split(state.info["rng"], 3)
+      new_lvl = jp.where(done, self._next_level(key_lvl, lvl, up, down), lvl)
+      streak = jp.where(new_lvl != lvl, 0, streak)
+      state.info["streak"] = streak
+
+      state.metrics["level"] = lvl.astype(jp.float32) * done
+      state.info["level"] = new_lvl
+      new_spawn = self._beam_spawn(key_sp, new_lvl)
+      state.info["spawn_xy"] = jp.where(done, new_spawn, state.info["spawn_xy"])
+      if "AutoResetWrapper_first_data" in state.info:
+        fd = state.info["AutoResetWrapper_first_data"]
+        q = fd.qpos.at[0:2].set(jp.where(done, new_spawn, fd.qpos[0:2]))
+        state.info["AutoResetWrapper_first_data"] = fd.replace(qpos=q)
 
     state.info["rng"], key = jax.random.split(state.info["rng"])
-    new_target = self._sample_target(key, state.info["spawn_xy"])
+    # new_target = self._sample_target(key, state.info["spawn_xy"])
+    if g.beam_cur:                                                            
+      new_target = self._cur_target(key, state.info["level"]) 
+    else:
+      new_target = self._sample_target(key, state.info["spawn_xy"])
     state.info["target_xy"] = jp.where(done, new_target, state.info["target_xy"])
+    state.info["dist0"] = jp.where(
+    done, jp.linalg.norm(new_target - state.info["spawn_xy"]), state.info["dist0"])
+    if g.cur_target in ("rings_polar", "rings_multi"):
+      state.info["tgt_cross"] = jp.where(
+          done, self._target_crosses_gap(new_target, state.info["level"]), state.info["tgt_cross"])
     state.info["rng"], key_yaw = jax.random.split(state.info["rng"])
     # new_yaw = jax.random.uniform(key_yaw, (), minval=-jp.pi, maxval=jp.pi)
     # state.info["target_yaw"] = jp.where(done, new_yaw, state.info["target_yaw"])
@@ -509,7 +630,7 @@ class Goal(go2_base.Go2Env):
     for k, v in rewards.items():
       state.metrics[f"reward/{k}"] = v
     state.metrics["swing_peak"] = jp.mean(state.info["swing_peak"])
-    success = timeout & ~fell & (d < self._config.goal_config.success_radius)
+    
     state.metrics["success"] = success.astype(jp.float32)
     state.metrics["fell_off"] = (data.qpos[2] < self._config.goal_config.fall_height).astype(jp.float32)
     state.metrics["final_dist"] = d * timeout
@@ -684,6 +805,7 @@ class Goal(go2_base.Go2Env):
         "reach": self._reward_reach(d, info["steps_left"], info["peak_left"]),
         # "bias": self._reward_bias(v_xy, to_target),
         "bias": self._reward_bias(v_xy, to_target) * info["bias_on"],
+        "tracking": self._reward_tracking(v_xy, to_target) * moving,
         "stall": self._cost_stall(moving, v_xy),
         "lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
         "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
@@ -770,6 +892,10 @@ class Goal(go2_base.Go2Env):
     # Reward for moving in the direction of the target.
     # return jp.dot(v_xy, to_target) / (jp.linalg.norm(v_xy) + 1e-6)
     return jp.dot(v_xy, to_target) / jp.maximum(jp.linalg.norm(v_xy), 0.1)
+
+  def _reward_tracking(self, v_xy: jax.Array, to_target: jax.Array) -> jax.Array:
+    # Extreme Parkour: velocity toward the target, capped at v_cmd (going faster than v_cmd earns nothing more)
+    return jp.minimum(jp.dot(v_xy, to_target), self._config.goal_config.v_cmd)
 
   def _cost_stall(self, moving: jax.Array, v_xy: jax.Array) -> jax.Array:
     # Penalize stalling when moving towards the target.
@@ -961,6 +1087,102 @@ class Goal(go2_base.Go2Env):
       return travel + jax.random.uniform(rng, (), minval=-g.yaw_jitter, maxval=g.yaw_jitter)
     return jax.random.uniform(rng, (), minval=-jp.pi, maxval=jp.pi)
 
+
+  def _beam_spawn(self, rng, level):
+    j = self._config.goal_config.beam_spawn_jitter
+    return self._lvl_origin[level] + jax.random.uniform(rng, (2,), minval=-j, maxval=j)
+
+  def _beam_target(self, rng, level):
+    g = self._config.goal_config
+    rng_k, rng_r = jax.random.split(rng)
+    k = jax.random.randint(rng_k, (), 0, self._n_beams)
+    th = 2 * jp.pi * k / self._n_beams             
+    r = jax.random.uniform(rng_r, minval=g.beam_r_range[0], maxval=g.beam_r_range[1])
+    return self._lvl_origin[level] + r * jp.array([jp.cos(th), jp.sin(th)])
+  def _frame_target(self, rng, level):
+    # goal on the outer frame: pick one of the 4 sides, then a point along it
+    rng_s, rng_t = jax.random.split(rng)
+    c = self._frame_c
+    side = jax.random.randint(rng_s, (), 0, 4)
+    t = jax.random.uniform(rng_t, minval=-c, maxval=c)
+    pts = jp.array([[c, t], [-c, t], [t, c], [t, -c]])
+    return self._lvl_origin[level] + pts[side]
+
+  def _ring_target(self, rng, level):
+    rng_k, rng_a = jax.random.split(rng)
+    c = self._ring_c[level]
+    k = jax.random.randint(rng_k, (), 0, c.shape[0])
+    th = jax.random.uniform(rng_a, minval=-jp.pi, maxval=jp.pi)
+    u = jp.array([jp.cos(th), jp.sin(th)])
+    u = u / jp.max(jp.abs(u))                       
+    return self._lvl_origin[level] + c[k] * u    
+  
+  def _ring_target_polar(self, rng, level):
+    # Sample a target in polar coordinates, with a uniform distribution in the annulus between the inner and outer gaps.
+    g = self._config.goal_config
+    n = 16
+    rng_r, rng_a, rng_f = jax.random.split(rng, 3)
+    r = jax.random.uniform(rng_r, (n,), minval=g.target_r_range[0], maxval=g.target_r_range[1])
+    th = jax.random.uniform(rng_a, (n,), minval=-jp.pi, maxval=jp.pi)
+    v = r[:, None] * jp.stack([jp.cos(th), jp.sin(th)], axis=-1)   
+    h = jp.max(jp.abs(v), axis=-1)                                  
+    m = g.target_margin
+    gi, go = self._gap_inner[level], self._gap_outer[level]
+    ok = (h < gi - m) | ((h > go + m) & (h < g.target_max_half))   
+    idx = jp.argmax(ok)                                              
+    fallback = self._ring_target(rng_f, level)                       
+    return jp.where(jp.any(ok), self._lvl_origin[level] + v[idx], fallback)
+
+
+  def _ring_target_multi(self, rng, level):
+    g = self._config.goal_config
+    n = 64
+    rng_r, rng_a, rng_f, rng_p = jax.random.split(rng, 4)
+    r = jax.random.uniform(rng_r, (n,), minval=g.target_r_range[0], maxval=g.target_r_range[1])
+    th = jax.random.uniform(rng_a, (n,), minval=-jp.pi, maxval=jp.pi)
+    v = r[:, None] * jp.stack([jp.cos(th), jp.sin(th)], axis=-1)
+    h = jp.max(jp.abs(v), axis=-1)
+    m = g.target_margin
+    gaps = self._gaps[level]                                   # (4, 2)
+    in_gap = jp.any((h[:, None] > gaps[None, :, 0] - m) & (h[:, None] < gaps[None, :, 1] + m), axis=-1)
+    ok = ~in_gap & (h < g.target_max_half)
+    far = ok & (h > self._gap_outer[level] + m)                # beyond the last gap
+    want_far = jax.random.uniform(rng_p) < g.target_far_frac
+    pick = jp.where(want_far & jp.any(far), far, ok)
+    idx = jp.argmax(pick)
+    fallback = self._ring_target(rng_f, level)
+    return jp.where(jp.any(pick), self._lvl_origin[level] + v[idx], fallback)
+
+  def _target_crosses_gap(self, target_xy, level):
+    # Check if the target crosses the inner gap of the ring.
+    h = jp.max(jp.abs(target_xy - self._lvl_origin[level]))
+    return h > self._gap_inner[level]
+
+  def _cur_target(self, rng, level):
+    g = self._config.goal_config
+    if g.cur_target == "beams_frame":
+      return self._frame_target(rng, level)
+    if g.cur_target == "rings_multi":
+      return self._ring_target_multi(rng, level)
+    if g.cur_target == "rings_polar":
+      return self._ring_target_polar(rng, level)
+    if g.cur_target == "rings":
+      return self._ring_target(rng, level)
+    return self._beam_target(rng, level)
+
+  def _init_level(self, rng):
+    g = self._config.goal_config
+    if g.fixed_level >= 0:
+      return jp.array(g.fixed_level, dtype=jp.int32)
+    return jax.random.randint(rng, (), 0, g.max_init_level + 1)
+
+  def _next_level(self, rng, level, up, down):
+    if self._config.goal_config.fixed_level >= 0:
+      return level
+    new = level + up.astype(jp.int32) - down.astype(jp.int32)
+    rand = jax.random.randint(rng, (), 0, self._n_levels)
+    new = jp.where(new >= self._n_levels, rand, new)   # wrap around to random level if above max
+    return jp.clip(new, 0, self._n_levels - 1)
   
   
   def sample_command(self, rng: jax.Array, x_k: jax.Array) -> jax.Array:

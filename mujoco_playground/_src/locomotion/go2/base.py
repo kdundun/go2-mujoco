@@ -70,22 +70,24 @@ class Go2Env(mjx_env.MjxEnv):
     self._mj_model.actuator_forcerange[knee_ids] = [-45.43, 45.43]
     self._mj_model.dof_frictionloss[6:] = 0.2
 
-    floor_id = self._mj_model.geom("floor").id
+    # floor_id = self._mj_model.geom("floor").id
     # for g in range(self._mj_model.ngeom):
     #   if g != floor_id and (self._mj_model.geom_contype[g] | self._mj_model.geom_conaffinity[g]):
     #     self._mj_model.geom_contype[g] = 0
     #     self._mj_model.geom_conaffinity[g] = 1
     mode = config.get("collision", "model")
     if mode != "model":
-      floor_id = self._mj_model.geom("floor").id
+      ground = {g for g in range(self._mj_model.ngeom)
+                if self._mj_model.geom_bodyid[g] == 0              
+                or self._mj_model.body(self._mj_model.geom_bodyid[g]).name == "terrain"}
       foot_ids = {self._mj_model.geom(n).id for n in consts.FEET_GEOMS}
       for g in range(self._mj_model.ngeom):
-        if g == floor_id or not (self._mj_model.geom_contype[g] | self._mj_model.geom_conaffinity[g]):
+        if g in ground or not (self._mj_model.geom_contype[g] | self._mj_model.geom_conaffinity[g]):
           continue
         if mode == "no_self" or g in foot_ids:
           self._mj_model.geom_contype[g] = 0
           self._mj_model.geom_conaffinity[g] = 1
-        else:   # feet_only，非脚部位
+        else:   # feet only
           self._mj_model.geom_contype[g] = 0
           self._mj_model.geom_conaffinity[g] = 0
 
